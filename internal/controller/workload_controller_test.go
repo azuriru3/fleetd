@@ -72,8 +72,9 @@ var _ = Describe("Workload Controller", func() {
 		It("should successfully reconcile the resource", func() {
 			By("Reconciling the created resource")
 			controllerReconciler := &WorkloadReconciler{
-				Client: k8sClient,
-				Scheme: k8sClient.Scheme(),
+				Client:    k8sClient,
+				Scheme:    k8sClient.Scheme(),
+				APIReader: k8sClient,
 			}
 
 			_, err := controllerReconciler.Reconcile(ctx, reconcile.Request{

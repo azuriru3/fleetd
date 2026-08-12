@@ -19,6 +19,7 @@ package controller
 import (
 	"context"
 	"fmt"
+	"slices"
 	"time"
 
 	corev1 "k8s.io/api/core/v1"
@@ -40,6 +41,18 @@ import (
 type WorkloadReconciler struct {
 	client.Client
 	Scheme *runtime.Scheme
+
+	// APIReader is a direct, uncached read against the API server, used
+	// only for the capacity math in pickCluster. Client is backed by an
+	// informer cache, which is fine for Get-ing the object a reconcile
+	// was triggered for, but scheduling decisions read OTHER objects
+	// too - and a scheduling decision made moments after a sibling
+	// Workload's own reconcile just wrote to several different objects
+	// can observe a cache snapshot that hasn't caught up with those
+	// writes yet. That caused a real overcommit: a just-evicted
+	// Workload re-placed itself using a stale view of what was still
+	// using the cluster's capacity. APIReader always reads live.
+	APIReader client.Reader
 }
 
 const readyConditionType = "Ready"
@@ -78,7 +91,7 @@ func (r *WorkloadReconciler) Reconcile(ctx context.Context, req ctrl.Request) (c
 		return ctrl.Result{}, nil
 	}
 
-	winner, err := r.pickCluster(ctx, &wl)
+	winner, evicted, err := r.pickCluster(ctx, &wl)
 	if err != nil {
 		log.Error(err, "Failed to evaluate clusters for Workload", "name", wl.Name)
 		return ctrl.Result{}, err
@@ -116,44 +129,78 @@ func (r *WorkloadReconciler) Reconcile(ctx context.Context, req ctrl.Request) (c
 		return ctrl.Result{}, err
 	}
 
-	log.Info("Reconciled Workload",
-		"name", wl.Name,
-		"priority", wl.Spec.Priority,
-		"assignedCluster", winner)
+	if len(evicted) > 0 {
+		log.Info("Reconciled Workload via preemption",
+			"name", wl.Name,
+			"priority", wl.Spec.Priority,
+			"assignedCluster", winner,
+			"evicted", evicted)
+	} else {
+		log.Info("Reconciled Workload",
+			"name", wl.Name,
+			"priority", wl.Spec.Priority,
+			"assignedCluster", winner)
+	}
 	return ctrl.Result{}, nil
 }
 
-// pickCluster scores every Ready cluster that has room for wl's requested
-// resources and returns the name of the tightest fit: the candidate that
-// would have the least cpu left over after placement. This is a
-// bin-packing strategy, favoring utilization density over spreading load
-// evenly. It returns an empty string, not an error, when nothing fits.
-func (r *WorkloadReconciler) pickCluster(ctx context.Context, wl *appsv1alpha1.Workload) (string, error) {
+// pickCluster finds a home for wl. It first tries every Ready cluster for
+// a normal bin-pack fit, exactly as Stage 4 did. Only if nothing fits
+// without disturbing anyone does it consider preemption: evicting some of
+// a candidate cluster's strictly-lower-priority residents to make room.
+// It returns the winning cluster and the names of anything evicted to
+// make that placement possible (nil if no eviction was needed). An empty
+// winner, not an error, means nothing fit even with preemption.
+func (r *WorkloadReconciler) pickCluster(ctx context.Context, wl *appsv1alpha1.Workload) (string, []string, error) {
 	var clusters appsv1alpha1.ClusterList
-	if err := r.List(ctx, &clusters); err != nil {
-		return "", fmt.Errorf("list clusters: %w", err)
+	if err := r.APIReader.List(ctx, &clusters); err != nil {
+		return "", nil, fmt.Errorf("list clusters: %w", err)
 	}
 
 	var workloads appsv1alpha1.WorkloadList
-	if err := r.List(ctx, &workloads); err != nil {
-		return "", fmt.Errorf("list workloads: %w", err)
+	if err := r.APIReader.List(ctx, &workloads); err != nil {
+		return "", nil, fmt.Errorf("list workloads: %w", err)
 	}
-	consumed := sumRequestsByCluster(workloads.Items)
-
+	placed := groupPlacedByCluster(workloads.Items)
 	requested := wl.Spec.Resources.Requests
 
+	var readyClusters []appsv1alpha1.Cluster
+	for _, c := range clusters.Items {
+		if meta.IsStatusConditionTrue(c.Status.Conditions, readyConditionType) {
+			readyClusters = append(readyClusters, c)
+		}
+	}
+
+	if winner := binPack(readyClusters, placed, requested); winner != "" {
+		return winner, nil, nil
+	}
+
+	bestCluster, bestVictims := bestPreemptionCandidate(readyClusters, placed, wl.Spec.Priority, requested)
+	if bestCluster == "" {
+		return "", nil, nil
+	}
+
+	names := make([]string, 0, len(bestVictims))
+	for i := range bestVictims {
+		if err := r.evict(ctx, &bestVictims[i], wl.Name); err != nil {
+			return "", nil, fmt.Errorf("evict %s: %w", bestVictims[i].Name, err)
+		}
+		names = append(names, bestVictims[i].Name)
+	}
+	return bestCluster, names, nil
+}
+
+// binPack returns the Ready cluster with the least cpu remaining after
+// placing requested, among clusters that already have room without
+// evicting anyone. Empty string if none fit.
+func binPack(clusters []appsv1alpha1.Cluster, placed map[string][]appsv1alpha1.Workload, requested corev1.ResourceList) string {
 	var best string
 	var bestRemainingCPU resource.Quantity
-	for _, c := range clusters.Items {
-		if !meta.IsStatusConditionTrue(c.Status.Conditions, readyConditionType) {
-			continue
-		}
-
-		remaining := subtractResources(c.Status.Allocatable, consumed[c.Name])
+	for _, c := range clusters {
+		remaining := subtractResources(c.Status.Allocatable, sumRequests(placed[c.Name]))
 		if !fits(requested, remaining) {
 			continue
 		}
-
 		afterPlacement := subtractResources(remaining, requested)
 		cpuAfter := afterPlacement[corev1.ResourceCPU]
 		if best == "" || cpuAfter.Cmp(bestRemainingCPU) < 0 {
@@ -161,30 +208,118 @@ func (r *WorkloadReconciler) pickCluster(ctx context.Context, wl *appsv1alpha1.W
 			bestRemainingCPU = cpuAfter
 		}
 	}
-	return best, nil
+	return best
 }
 
-// sumRequestsByCluster adds up the resource requests of every already
-// placed Workload, grouped by which cluster it landed on. An unplaced
-// Workload (assignedCluster empty) contributes nothing.
-func sumRequestsByCluster(workloads []appsv1alpha1.Workload) map[string]corev1.ResourceList {
-	sums := map[string]corev1.ResourceList{}
+// bestPreemptionCandidate evaluates every Ready cluster for whether
+// evicting some of its strictly-lower-priority residents would make room,
+// and returns whichever candidate needs the fewest evictions. Ties are
+// broken the same way as binPack: least cpu remaining after placement.
+func bestPreemptionCandidate(clusters []appsv1alpha1.Cluster, placed map[string][]appsv1alpha1.Workload, preemptorPriority int32, requested corev1.ResourceList) (string, []appsv1alpha1.Workload) {
+	var bestCluster string
+	var bestVictims []appsv1alpha1.Workload
+	var bestRemainingCPU resource.Quantity
+
+	for _, c := range clusters {
+		victims, remainingAfterEviction, ok := planEviction(c.Status.Allocatable, placed[c.Name], preemptorPriority, requested)
+		if !ok {
+			continue
+		}
+		afterPlacement := subtractResources(remainingAfterEviction, requested)
+		cpuAfter := afterPlacement[corev1.ResourceCPU]
+
+		better := bestCluster == "" ||
+			len(victims) < len(bestVictims) ||
+			(len(victims) == len(bestVictims) && cpuAfter.Cmp(bestRemainingCPU) < 0)
+		if better {
+			bestCluster = c.Name
+			bestVictims = victims
+			bestRemainingCPU = cpuAfter
+		}
+	}
+	return bestCluster, bestVictims
+}
+
+// planEviction decides whether evicting some subset of residents (only
+// those strictly lower priority than preemptorPriority) would free enough
+// room for requested. Residents are evicted lowest-priority-first,
+// stopping as soon as there's enough room - a greedy choice, not an
+// optimal one, made to keep this simple rather than solving a knapsack
+// problem to minimize disruption. Returns the workloads to evict, the
+// cluster's remaining capacity after those evictions, and whether a fit
+// was found at all.
+func planEviction(allocatable corev1.ResourceList, residents []appsv1alpha1.Workload, preemptorPriority int32, requested corev1.ResourceList) ([]appsv1alpha1.Workload, corev1.ResourceList, bool) {
+	evictable := make([]appsv1alpha1.Workload, 0, len(residents))
+	for _, wl := range residents {
+		if wl.Spec.Priority < preemptorPriority {
+			evictable = append(evictable, wl)
+		}
+	}
+	slices.SortFunc(evictable, func(a, b appsv1alpha1.Workload) int {
+		return int(a.Spec.Priority) - int(b.Spec.Priority)
+	})
+
+	remaining := subtractResources(allocatable, sumRequests(residents))
+	var victims []appsv1alpha1.Workload
+	for _, candidate := range evictable {
+		if fits(requested, remaining) {
+			break
+		}
+		remaining = addResources(remaining, candidate.Spec.Resources.Requests)
+		victims = append(victims, candidate)
+	}
+	if !fits(requested, remaining) {
+		return nil, nil, false
+	}
+	return victims, remaining, true
+}
+
+// evict clears a victim's placement and marks it Preempted. It re-fetches
+// the victim first rather than trusting the copy from an earlier List
+// call, since that snapshot may be stale by the time this write happens.
+func (r *WorkloadReconciler) evict(ctx context.Context, victim *appsv1alpha1.Workload, preemptor string) error {
+	var fresh appsv1alpha1.Workload
+	if err := r.Get(ctx, client.ObjectKeyFromObject(victim), &fresh); err != nil {
+		return err
+	}
+
+	fresh.Status.AssignedCluster = ""
+	meta.SetStatusCondition(&fresh.Status.Conditions, metav1.Condition{
+		Type:               readyConditionType,
+		Status:             metav1.ConditionFalse,
+		Reason:             "Preempted",
+		Message:            fmt.Sprintf("evicted to make room for higher priority workload %q", preemptor),
+		ObservedGeneration: fresh.Generation,
+	})
+	return r.Status().Update(ctx, &fresh)
+}
+
+// groupPlacedByCluster groups already-placed Workloads by which cluster
+// they landed on. An unplaced Workload (assignedCluster empty) is never
+// included, so the Workload currently being reconciled never appears
+// here even though it's in the same List result.
+func groupPlacedByCluster(workloads []appsv1alpha1.Workload) map[string][]appsv1alpha1.Workload {
+	groups := map[string][]appsv1alpha1.Workload{}
 	for _, wl := range workloads {
 		if wl.Status.AssignedCluster == "" {
 			continue
 		}
-		existing := sums[wl.Status.AssignedCluster]
-		if existing == nil {
-			existing = corev1.ResourceList{}
-		}
-		for name, qty := range wl.Spec.Resources.Requests {
-			total := existing[name]
-			total.Add(qty)
-			existing[name] = total
-		}
-		sums[wl.Status.AssignedCluster] = existing
+		groups[wl.Status.AssignedCluster] = append(groups[wl.Status.AssignedCluster], wl)
 	}
-	return sums
+	return groups
+}
+
+// sumRequests adds up the resource requests across a set of Workloads.
+func sumRequests(workloads []appsv1alpha1.Workload) corev1.ResourceList {
+	total := corev1.ResourceList{}
+	for _, wl := range workloads {
+		for name, qty := range wl.Spec.Resources.Requests {
+			existing := total[name]
+			existing.Add(qty)
+			total[name] = existing
+		}
+	}
+	return total
 }
 
 // subtractResources returns a - b, per resource name. A name missing from
@@ -198,6 +333,20 @@ func subtractResources(a, b corev1.ResourceList) corev1.ResourceList {
 		remaining := result[name]
 		remaining.Sub(qty)
 		result[name] = remaining
+	}
+	return result
+}
+
+// addResources returns a + b, per resource name.
+func addResources(a, b corev1.ResourceList) corev1.ResourceList {
+	result := corev1.ResourceList{}
+	for name, qty := range a {
+		result[name] = qty.DeepCopy()
+	}
+	for name, qty := range b {
+		total := result[name]
+		total.Add(qty)
+		result[name] = total
 	}
 	return result
 }
