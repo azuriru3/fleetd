@@ -173,3 +173,103 @@ The intended design was for the controller to read Secrets only from the `fleetd
 As a result, the manager can currently read Secrets across the cluster, which is broader access than intended.
 
 This does not prevent the current design from working, but it should be tightened before treating the RBAC configuration as production-ready.
+
+## Placement and Scoring
+
+Stage 4 introduces the first real placement decision.
+
+When a `Workload` needs to be placed, the controller looks at the registered clusters and decides which one should receive it. The controller does not simply look at the raw capacity of each cluster. It first works out how much capacity is already being used.
+
+The process is:
+
+1. Find all clusters that are `Ready`.
+2. Find all existing `Workload` objects and group their resource requests by `status.assignedCluster`.
+3. Subtract the consumed resources from each cluster's allocatable resources.
+4. Remove clusters that do not have enough remaining capacity for the new workload.
+5. From the remaining candidates, choose the cluster that would have the **least CPU remaining** after placing the workload.
+
+This means the decision is based on actual remaining capacity rather than just the total capacity reported by the cluster.
+
+An unreachable or unhealthy cluster is not considered for placement. The controller uses the cluster's `Ready` condition as the first filter, so a cluster that is not ready cannot become a placement candidate.
+
+## Bin-Packing Strategy
+
+The scoring strategy implemented here is **bin-packing**.
+
+In simple terms, the controller tries to fill the clusters that are already more heavily used before using an empty cluster.
+
+For example, a 6 CPU workload was placed on `member-b`. When another 1 CPU workload was created, it was also placed on `member-b` even though `member-a` was empty.
+
+That is direct evidence of the bin-packing behavior.
+
+The alternative is **spreading**, where workloads are distributed more evenly across available clusters.
+
+Both strategies have valid uses:
+
+* Bin-packing improves utilization by concentrating workloads and leaving other capacity available.
+* Spreading provides more isolation because workloads are distributed across more clusters.
+
+Bin-packing was chosen here because it also creates the conditions needed for the next stage. Preemption becomes meaningful when clusters actually become full. Filling available capacity is therefore a natural fit for demonstrating preemption later.
+
+Spread is not implemented yet. This is intentional. Proving one real scoring strategy from end to end is more useful at this stage than adding a configuration option for another strategy that has not been tested.
+
+## CPU Is the Only Scored Resource
+
+The workload still contains Kubernetes resource requirements, but only CPU is used to rank clusters against each other.
+
+Eligibility is checked against every resource the workload actually requests. If a workload asks for more memory than a cluster has remaining, that cluster is filtered out in step 4 regardless of CPU. So a workload is never placed onto a cluster that cannot actually fit it.
+
+What is CPU-only is the tiebreak in step 5. Among clusters that already passed the eligibility check, the one with the least CPU remaining after placement wins. Memory is not used to break that tie.
+
+A real scheduler would normally rank across multiple dimensions, potentially with different weights. That is not necessary to prove the mechanism here. CPU alone is enough to demonstrate ranking behavior. Adding more scoring dimensions to the ranking step would add complexity without another stage currently depending on it.
+
+## Placement Is Sticky
+
+Once a workload has been assigned to a cluster, the controller does not continuously reconsider the decision.
+
+Re-evaluating every existing workload whenever cluster capacity changes would introduce a different feature: **rebalancing**.
+
+Rebalancing means deciding whether moving an already-running workload to another cluster is worth the disruption caused by moving it. That is a separate problem from deciding where a new workload should go.
+
+For this reason, initial placement and rebalancing are kept separate. The current stage handles the first placement only. Rebalancing can be added later if there is a reason to need it.
+
+## Priority Is Not Used for Placement Yet
+
+`spec.priority` already exists and is logged, but the placement algorithm does not currently use it.
+
+This is deliberate, because simply reading the priority inside `pickCluster` would not actually create priority-aware scheduling.
+
+Kubernetes controllers process reconciliation work through their workqueue based on when work arrives. They do not automatically process objects according to a `priority` field.
+
+For example, if a priority-10 workload and a priority-90 workload arrive at roughly the same time and there is only enough capacity for one of them, whichever reconciliation happens first can claim the available capacity. The higher-priority workload does not automatically jump ahead.
+
+True priority-aware placement would require a priority-aware queue or another mechanism for coordinating competing workloads.
+
+There is another way to handle this. The controller can allow the initial placement to happen, then detect that a higher-priority workload needs the capacity and preempt the lower-priority workload.
+
+That is the approach intended for Stage 5.
+
+So priority is already part of the data model, but its actual scheduling effect is intentionally deferred to preemption.
+
+## Reacting to Available Capacity
+
+The placement controller also needs to react when a cluster becomes available again.
+
+This was tested by deregistering both clusters and creating a workload that could not be placed. After registering one cluster again, the workload was placed in about **0.63 seconds**.
+
+This is important because the controller also has a 15-second polling interval. A placement that happened in less than a second could not have been caused by waiting for the next poll.
+
+The result proves that the cluster watch is triggering the reconciliation when cluster state changes.
+
+The controller therefore has two useful behaviors:
+
+* It periodically checks for placement opportunities.
+* It reacts directly when relevant cluster changes happen.
+
+## No Capacity
+
+If no Ready cluster has enough remaining capacity for the requested workload, the workload is left unplaced and the controller reports that there is no capacity.
+
+A 999 CPU workload was tested and correctly returned `NoCapacity`.
+
+This is an important part of the design because placement is not guaranteed. The scheduler should not assign a workload to a cluster simply because it needs somewhere to go. The selected cluster must actually have enough remaining capacity.
