@@ -92,3 +92,84 @@ Changing the priority from `10` to `90` caused the resource to be reconciled aga
 Deleting the workload was also handled cleanly through the existing `NotFound` path.
 
 The important point is that adding more fields did not change the basic controller design. The object still represents desired state, the controller observes that state, and status records what the controller has actually decided.
+
+## Cluster Registration and Hub-and-Spoke Communication
+
+Stage 3 introduces the `Cluster` resource. Unlike `Workload`, a `Cluster` is cluster-scoped because a registered Kubernetes cluster is not part of a particular namespace. This follows the same general model Kubernetes uses for resources such as `Node` and `StorageClass`.
+
+The `Cluster` object represents a cluster that fleetd can communicate with.
+
+### Credentials stay in a Secret
+
+The `Cluster` spec does not contain the kubeconfig itself. Instead, `spec.kubeconfigSecretRef` points to a Kubernetes Secret containing the credentials.
+
+This keeps credentials separate from the cluster registration object. Someone can inspect the `Cluster` resource with `kubectl get -o yaml` without exposing the credentials needed to access the member cluster.
+
+The object also does not have a separate `spec.labels` field. Kubernetes objects already have `metadata.labels`, so adding another labeling mechanism would duplicate something Kubernetes already provides.
+
+### Observed cluster state
+
+The controller records information it actually observes in status.
+
+`status.allocatable` contains the resources available on the member cluster. The controller gets this information by connecting to the cluster and reading its Nodes. This is observed state, not something a user specifies.
+
+This is important for the next stage because the scoring logic will need to know how much CPU, memory, and other resources each cluster can provide.
+
+`status.lastHeartbeatTime` serves a different purpose. It shows that fleetd was able to successfully communicate with the cluster. The resource information and the heartbeat are therefore separate signals. A cluster could have resource information recorded, while the heartbeat tells us whether communication is still working now.
+
+### Hub-and-spoke model
+
+The design uses a hub-and-spoke model.
+
+fleetd runs on the main cluster and connects directly to each registered member cluster using the kubeconfig stored in the referenced Secret. The member clusters do not need to run another fleetd agent that reports information back to the hub.
+
+This is similar to the architecture used by systems such as Karmada and Admiralty.
+
+An agent-based model can be more practical at larger scale, especially when member clusters are behind NAT or cannot accept connections from the hub. However, it would also mean building, deploying, and maintaining another binary.
+
+For this stage, the hub connecting directly to the member clusters is simpler and is enough to prove the core behavior.
+
+### Read and write access are tested separately
+
+Successfully listing Nodes proves that fleetd can authenticate to the member cluster and read information.
+
+It does not prove that fleetd can actually create or modify resources.
+
+That distinction matters because a later stage will need fleetd to create real workloads on member clusters. Therefore, this stage also writes a heartbeat ConfigMap to the member cluster.
+
+The read and write paths were verified independently by connecting to the member clusters with their own kubeconfigs and checking that the ConfigMap actually existed. This avoids relying only on fleetd's own status to prove that the operation succeeded.
+
+## Avoiding Reconcile Loops
+
+The Cluster controller exposed an important problem with watching resources that the controller itself updates.
+
+Initially, the controller watched all updates to `Cluster`. Every reconcile updated `status.lastHeartbeatTime`. Since that status update was itself an update to the `Cluster` object, the watch immediately triggered another reconcile.
+
+This created pairs of reconciles. The logs showed two reconciles at almost the same time, such as `12:06:24` twice and `12:06:57` twice.
+
+There was also a `RequeueAfter` timer configured to run the heartbeat again after roughly 30 seconds. This meant the controller could trigger another reconcile through two different paths:
+
+1. The heartbeat timer.
+2. Its own status update.
+
+The problem is different from Stage 1 and Stage 2. Those controllers only update status when the status actually changes. The heartbeat is intentionally different because `lastHeartbeatTime` is supposed to change on every successful heartbeat.
+
+The fix was to add `predicate.GenerationChangedPredicate` to the Cluster watch.
+
+The generation of a Kubernetes object changes when its spec changes, but not when the controller only changes its status. The predicate therefore allows creation and spec changes to trigger reconciliation while ignoring status-only updates made by the controller itself.
+
+The `RequeueAfter` timer still works normally because it is an internal workqueue requeue, not an object update event. The predicate does not block it.
+
+After the fix, the logs showed single reconciles roughly 33 seconds apart, such as `12:09:09`, `12:09:42`, and `12:10:15`. The duplicate reconciles were gone.
+
+The general lesson is that a controller needs to be careful about what events it watches when it also writes to the same resource. A status update should not accidentally become an endless source of its own reconciliation events.
+
+## Known RBAC Limitation
+
+There is currently a known RBAC gap.
+
+The intended design was for the controller to read Secrets only from the `fleetd-system` namespace. However, the generated RBAC rules placed that permission in the same cluster-wide `ClusterRole` used by the controller.
+
+As a result, the manager can currently read Secrets across the cluster, which is broader access than intended.
+
+This does not prevent the current design from working, but it should be tightened before treating the RBAC configuration as production-ready.
