@@ -273,3 +273,169 @@ If no Ready cluster has enough remaining capacity for the requested workload, th
 A 999 CPU workload was tested and correctly returned `NoCapacity`.
 
 This is an important part of the design because placement is not guaranteed. The scheduler should not assign a workload to a cluster simply because it needs somewhere to go. The selected cluster must actually have enough remaining capacity.
+
+## Preemption
+
+Stage 5 adds preemption to the placement process.
+
+Normal placement still happens first. The controller tries the Stage 4 bin-pack strategy and looks for a cluster where the workload already fits.
+
+Preemption is only considered when no cluster has enough free capacity.
+
+For each Ready cluster, the controller looks at the workloads already assigned there. Only workloads with a **lower priority** than the new workload can be considered for eviction.
+
+The eviction process is deliberately simple:
+
+1. Find residents with a lower priority than the new workload.
+2. Sort them from lowest priority to highest priority.
+3. Evict them one at a time.
+4. After each eviction, check whether enough capacity is now available.
+5. Stop as soon as the new workload fits.
+
+If multiple clusters can satisfy the workload through preemption, the controller chooses the cluster that needs the fewest evictions. If there is a tie, it uses the same CPU-remaining scoring rule from Stage 4.
+
+### Why priorities must be strictly lower
+
+A workload can only preempt another workload with a **strictly lower** priority.
+
+Equal priority is not enough.
+
+This prevents a cycle where two workloads with the same priority could keep evicting each other. For example, if workload A could evict B and B could also evict A, the two reconciles could continuously undo each other.
+
+Strictly decreasing priority removes that possibility. A priority-90 workload can evict priority-80, but priority-90 cannot evict another priority-90 workload.
+
+This was tested directly. A priority-90 workload that needed 9 CPU was refused even though evicting another priority-90 workload would have created enough capacity. The existing priority-90 workload was left untouched.
+
+## Greedy Eviction
+
+The eviction algorithm is greedy rather than optimal.
+
+The theoretically optimal solution would find the smallest-disruption combination of workloads whose resources are enough to make room. That becomes a knapsack-style problem.
+
+The current implementation simply removes the lowest-priority workloads first until there is enough capacity.
+
+This is a deliberate simplification. In the normal case, it produces the expected result without adding a much more complicated optimization algorithm.
+
+It was verified with three low-priority workloads filling a cluster. A higher-priority workload needing 6 CPU caused only the two least important workloads to be evicted. The third workload had a higher priority than those two and was left running.
+
+The more complicated optimal approach can be added later if irregular workload sizes make greedy eviction insufficient.
+
+## Status During Preemption
+
+No new status fields were added for preemption.
+
+The existing `Ready` condition is reused. When a workload is evicted, its condition becomes:
+
+`Ready=False, Reason=Preempted`
+
+This follows the same design used throughout the project. A new status field is only introduced when something actually needs to consume that information.
+
+# The Cache Consistency Problem
+
+The most important discovery in this stage was not the preemption algorithm itself. It was a cache consistency problem that only appeared during a real live run.
+
+The first live preemption test looked correct at first.
+
+Three low-priority workloads filled a 12 CPU cluster. A high-priority workload arrived, evicted two of them, and took their capacity.
+
+Then something unexpected happened.
+
+One of the workloads that had just been evicted immediately placed itself back onto the same cluster. The cluster now had 14 CPU claimed against only 12 CPU available.
+
+The problem was not the preemption decision itself. The problem was what the next reconciliation saw when it calculated capacity.
+
+## What actually happened
+
+The high-priority workload's reconcile function performed several writes to the API server:
+
+1. Evict the first victim.
+2. Evict the second victim.
+3. Place the high-priority workload.
+
+Each write caused an update event.
+
+The victim's reconcile then ran after the evicting reconcile had finished. It listed workloads to calculate how much capacity was available.
+
+That list came from the manager's normal cached client.
+
+The important detail is that the cache is updated asynchronously. The API server already contained the latest changes, but the informer's cache had not necessarily received all of those changes yet.
+
+The victim therefore calculated capacity using a slightly stale snapshot.
+
+It saw capacity that had already been consumed and concluded that it could place itself back onto the cluster.
+
+The result was an overcommitted cluster.
+
+## Why this matters beyond preemption
+
+This is a general controller design issue.
+
+Reading the object that triggered a reconcile is normally safe because the event and that object's state are connected.
+
+The situation is different when a controller makes a decision based on a collection of other objects that may have just been modified.
+
+For example, the scheduler needs to answer:
+
+> How much capacity is actually being used across all clusters right now?
+
+That calculation depends on multiple `Workload` objects. If another reconcile has just changed those workloads, the cached list may temporarily lag behind the API server.
+
+A controller therefore cannot assume that every cached read represents the latest possible state when making a cross-object scheduling decision.
+
+## The Fix
+
+The capacity calculation now uses `mgr.GetAPIReader()` for the relevant list operations.
+
+This performs a direct, uncached read from the Kubernetes API server.
+
+The normal cached client is still used for the object currently being reconciled. Only the cross-object reads that directly affect scheduling and capacity decisions use the direct API reader.
+
+This keeps the fast cached path for normal controller work while using a stronger consistency guarantee where the scheduling decision actually depends on it.
+
+## Why the Tests Did Not Catch It
+
+The existing unit tests did not expose this problem because the envtest setup was not using the same cached client architecture as the real manager.
+
+The test client was created directly with `client.New(...)`. It was therefore not going through an informer-backed manager cache.
+
+The bug was effectively invisible in those tests.
+
+It only appeared when the controller was running under a real manager against a real Kubernetes cluster, where the cache and API server are separate and updates propagate asynchronously.
+
+This is an important limitation of the test setup. A green envtest result does not prove that a controller is safe from stale-cache problems when its logic depends on recently changed objects.
+
+# Priority and Fairness
+
+Preemption makes scheduling priority-aware, but it does not make the scheduler fully fair.
+
+This distinction matters.
+
+Suppose capacity becomes available on a cluster and several unplaced workloads are waiting. The controller does not currently process those workloads in priority order. Their reconciliation order is determined by the workqueue.
+
+A priority-90 workload may therefore be evaluated before or after lower-priority workloads depending on when their reconcile requests are processed.
+
+This was observed directly when a priority-90 workload claimed newly available capacity before two lower-priority workloads.
+
+That does not mean priority is broken.
+
+The purpose of Stage 5 is to prevent a lower-priority workload from permanently occupying capacity that a higher-priority workload needs. Preemption solves that problem.
+
+It does not solve the separate problem of deciding which waiting workload should get newly available capacity first.
+
+So the current system provides **priority-aware preemption**, but not **priority-aware queue ordering or fair scheduling**. Those are different scheduling properties and should not be treated as the same thing.
+
+# Reconcile Concurrency
+
+The controller currently uses the default `MaxConcurrentReconciles` setting, which is 1.
+
+Workload reconciles therefore run one at a time.
+
+This is why the preemption implementation does not currently need explicit locking or conflict-retry logic to protect two Workload reconciles from simultaneously claiming the same capacity.
+
+There is no concurrent Workload reconcile competing for that capacity in the current configuration.
+
+This simplifies the implementation, but it is also a scale limitation.
+
+If reconciliation is made concurrent in a later stage, the scheduling and preemption logic will need to be revisited. At that point, two reconciles could potentially make decisions from the same state and attempt conflicting updates.
+
+For now, single-worker reconciliation is a deliberate simplification that keeps the Stage 5 correctness model straightforward.
