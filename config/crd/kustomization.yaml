@@ -3,6 +3,7 @@
 # It should be run by config/default
 resources:
 - bases/apps.fleetd.dev_workloads.yaml
+- bases/apps.fleetd.dev_clusters.yaml
 # +kubebuilder:scaffold:crdkustomizeresource
 
 patches:

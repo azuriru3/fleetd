@@ -1,0 +1,10 @@
+apiVersion: apps.fleetd.dev/v1alpha1
+kind: Cluster
+metadata:
+  labels:
+    app.kubernetes.io/name: fleetd
+    app.kubernetes.io/managed-by: kustomize
+  name: cluster-sample
+spec:
+  kubeconfigSecretRef:
+    name: cluster-sample-kubeconfig

@@ -5,8 +5,17 @@ metadata:
   name: manager-role
 rules:
 - apiGroups:
+  - ""
+  resources:
+  - secrets
+  verbs:
+  - get
+  - list
+  - watch
+- apiGroups:
   - apps.fleetd.dev
   resources:
+  - clusters
   - workloads
   verbs:
   - create
@@ -19,12 +28,14 @@ rules:
 - apiGroups:
   - apps.fleetd.dev
   resources:
+  - clusters/finalizers
   - workloads/finalizers
   verbs:
   - update
 - apiGroups:
   - apps.fleetd.dev
   resources:
+  - clusters/status
   - workloads/status
   verbs:
   - get
